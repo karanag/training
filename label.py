@@ -151,10 +151,14 @@ def main():
     lr["lr_slope_prev"] = lr["lr_slope"].shift(1)
     lr = lr.dropna(subset=["lr_mid_prev","lr_slope_prev"])
 
+    # Merge OHLC back so detect_crosses has 'high' and 'low'
+    lr = lr.merge(m[["open","high","low","close"]], left_index=True, right_index=True)
+
     crosses = detect_crosses(
         lr.rename(columns={"lr_mid_prev":"lr_mid","lr_slope_prev":"lr_slope"}),
         cross_on=cross_on
     )
+
 
     ev_long = crosses[crosses["long_sig"]].copy()
     ev_long["side"] = "long"
