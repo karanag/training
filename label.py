@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 Entry candidate generator via Linear Regression (LR) midline cross on 1-minute bars.
-Leak-safe (no lookahead).
+Leak-safe (no lookahead), Colab-optimized with Numba.
 
-Colab-friendly defaults (just run `!python label.py`):
+Defaults (just run `!python label.py` in Colab):
     features  = "/content/drive/MyDrive/data/features.csv"
     lr_window = 7
-    cross_on  = "wick"     # "close" also supported
-    tp        = 30.0       # points
-    sl        = 15.0       # points
-    horizon_s = 600        # seconds
+    cross_on  = "wick"
+    tp        = 30.0
+    sl        = 15.0
+    horizon_s = 600
 
 Output:
     candidates_lr.csv with columns:
@@ -20,13 +20,14 @@ Output:
         hit ("tp" / "sl" / "none"),
         t_hit_s (seconds to first hit, NaN if none),
         mfe, mae,
-        features_key_dt (same as entry_time)
+        features_key_dt
 """
 import os
 import numpy as np
 import pandas as pd
+from numba import njit
 
-# ---------------- Resample helpers ----------------
+# ---------------- 1m Resample ----------------
 def resample_1m(df_1s: pd.DataFrame) -> pd.DataFrame:
     m = df_1s.resample("1min", on="datetime").agg(
         open = ("open", "first"),
@@ -37,11 +38,8 @@ def resample_1m(df_1s: pd.DataFrame) -> pd.DataFrame:
     m.index.name = "datetime"
     return m
 
+# ---------------- Rolling LR ----------------
 def rolling_lr_midline_close(df_1m: pd.DataFrame, window: int) -> pd.DataFrame:
-    """
-    Rolling linear regression y = a + b*x on CLOSE over 'window' minutes.
-    Returns midline at the last x in each window (aligned to the minute index).
-    """
     y = df_1m["close"].to_numpy(dtype=np.float64)
     n = len(y)
     x = np.arange(n, dtype=np.float64)
@@ -51,33 +49,18 @@ def rolling_lr_midline_close(df_1m: pd.DataFrame, window: int) -> pd.DataFrame:
     for i in range(window - 1, n):
         xs = x[i - window + 1:i + 1] - x[i - window + 1]
         ys = y[i - window + 1:i + 1]
-        b, a = np.polyfit(xs, ys, 1)  # returns slope b, intercept a
+        b, a = np.polyfit(xs, ys, 1)
         slope[i] = b
         intercept[i] = a
 
     mid = intercept + slope * (window - 1)
-
     out = df_1m.copy()
     out["lr_mid"] = mid
     out["lr_slope"] = slope
     return out
 
+# ---------------- Cross Detection ----------------
 def detect_crosses(df_lr: pd.DataFrame, cross_on: str = "close") -> pd.DataFrame:
-    """
-    Detect cross of price vs (previous-minute) LR midline.
-
-    Expect df_lr to have columns:
-      open, high, low, close, lr_mid, lr_slope
-    where lr_mid is already the previous-minute LR midline (i.e., shifted).
-
-    'wick' logic (recommended):
-      long  if (prev low <= lr_mid) and (curr high > lr_mid)
-      short if (prev high >= lr_mid) and (curr low  < lr_mid)
-
-    'close' logic:
-      long  if (prev close <= lr_mid) and (curr close > lr_mid)
-      short if (prev close >= lr_mid) and (curr close < lr_mid)
-    """
     lr = df_lr["lr_mid"]
 
     if cross_on == "wick":
@@ -95,7 +78,7 @@ def detect_crosses(df_lr: pd.DataFrame, cross_on: str = "close") -> pd.DataFrame
     short_sig = (prev_above & curr_below).fillna(False)
 
     out = pd.DataFrame({
-        "datetime": df_lr.index,   # explicit column (not index)
+        "datetime": df_lr.index,
         "close": df_lr["close"].to_numpy(),
         "high":  df_lr["high"].to_numpy(),
         "low":   df_lr["low"].to_numpy(),
@@ -104,193 +87,172 @@ def detect_crosses(df_lr: pd.DataFrame, cross_on: str = "close") -> pd.DataFrame
         "long_sig":  long_sig.to_numpy().astype(bool),
         "short_sig": short_sig.to_numpy().astype(bool),
     })
-    # Ensure there's no index named 'datetime' to avoid sort ambiguity
     out.index = pd.RangeIndex(len(out))
     return out
 
-# ---------------- Labeling ----------------
-def make_labels_1s(
-    df_1s: pd.DataFrame,
-    events: pd.DataFrame,
-    tp: float,
-    sl: float,
-    horizon_s: int
-) -> pd.DataFrame:
-    """
-    For each minute event (datetime), align to the last second inside that minute,
-    enter at the NEXT second's open, simulate for 'horizon_s' seconds.
+# ---------------- Numba Labeling Core ----------------
+@njit
+def label_events_numba(entry_idx, entry_px, sides, highs, lows, times, tp, sl, horizon_s):
+    n = len(entry_idx)
+    labels = np.zeros(n, dtype=np.int32)
+    hits = np.empty(n, dtype=np.int32)  # 0=none,1=tp,2=sl
+    t_hits = np.full(n, np.nan)
+    mfes = np.zeros(n)
+    maes = np.zeros(n)
 
-    Label = 1 if TP is hit before SL, otherwise 0.
-    Also returns which hit, time-to-hit in seconds, MFE/MAE (absolute P&L in points).
-    """
-    s = df_1s.copy().sort_values("datetime").reset_index(drop=True)
+    for i in range(n):
+        idx = entry_idx[i]
+        px = entry_px[i]
+        side = sides[i]
+        entry_time = times[idx]
+        end_time = entry_time + horizon_s * 1_000_000_000
 
-    # Map each minute to the last second in that minute
+        mfe = -1e9
+        mae = 1e9
+        hit = 0
+        label = 0
+        t_hit = np.nan
+
+        j = idx
+        while j < len(times) and times[j] <= end_time:
+            hi = highs[j]
+            lo = lows[j]
+            if side == 1:  # long
+                mfe = max(mfe, hi - px)
+                mae = min(mae, lo - px)
+                if hit == 0:
+                    if hi >= px + tp:
+                        hit, label, t_hit = 1, 1, (times[j] - entry_time)//1_000_000_000
+                        break
+                    elif lo <= px - sl:
+                        hit, label, t_hit = 2, 0, (times[j] - entry_time)//1_000_000_000
+                        break
+            else:  # short
+                mfe = max(mfe, px - lo)
+                mae = min(mae, px - hi)
+                if hit == 0:
+                    if lo <= px - tp:
+                        hit, label, t_hit = 1, 1, (times[j] - entry_time)//1_000_000_000
+                        break
+                    elif hi >= px + sl:
+                        hit, label, t_hit = 2, 0, (times[j] - entry_time)//1_000_000_000
+                        break
+            j += 1
+
+        if hit == 0:
+            mfe = max(mfe, 0.0)
+            mae = min(mae, 0.0)
+
+        labels[i] = label
+        hits[i] = hit
+        t_hits[i] = t_hit
+        mfes[i] = mfe
+        maes[i] = mae
+
+    return labels, hits, t_hits, mfes, maes
+
+# ---------------- Fast Label Wrapper ----------------
+def make_labels_1s_fast(df_1s, events, tp, sl, horizon_s):
+    s = df_1s.sort_values("datetime").reset_index(drop=True)
+    times = s["datetime"].astype("int64").to_numpy()
+    highs = s["high"].to_numpy()
+    lows  = s["low"].to_numpy()
+    opens = s["open"].to_numpy()
+
+    # map events to entry indices
     s["minute_dt"] = s["datetime"].dt.floor("min")
-    last_second_per_min = (
-        s.groupby("minute_dt")
-         .tail(1)[["minute_dt", "datetime"]]
-         .drop_duplicates("minute_dt")
-         .rename(columns={"datetime": "sec_dt"})
+    last_secs = (
+        s.groupby("minute_dt").tail(1)[["minute_dt","datetime"]]
+        .rename(columns={"datetime":"sec_dt"})
     )
-
     ev = events.copy()
     ev["minute_dt"] = pd.to_datetime(ev["datetime"])
-    ev = ev.merge(last_second_per_min, on="minute_dt", how="left")
+    ev = ev.merge(last_secs, on="minute_dt", how="left")
 
-    # For speed, index the 1s frame
-    s = s.set_index("datetime")
-
-    rows = []
+    entry_idx, entry_px, sides = [], [], []
+    entry_times = []
     for _, e in ev.iterrows():
-        if pd.isna(e.get("sec_dt")):
-            continue
+        if pd.isna(e.get("sec_dt")): continue
+        sec_ns = np.int64(e["sec_dt"].value)
+        idx = np.searchsorted(times, sec_ns)
+        if idx >= len(times)-1: continue
+        entry_idx.append(idx+1)
+        entry_px.append(opens[idx+1])
+        sides.append(1 if e["side"]=="long" else -1)
+        entry_times.append(times[idx+1])
 
-        minute_end = e["sec_dt"]
+    if not entry_idx:
+        return pd.DataFrame()
 
-        # Entry at the FIRST tick strictly after minute_end
-        after = s.loc[s.index > minute_end]
-        if after.empty:
-            continue
-        entry_time = after.index[0]
-        entry_px   = float(after.iloc[0]["open"])
+    labels, hits, t_hits, mfes, maes = label_events_numba(
+        np.array(entry_idx), np.array(entry_px), np.array(sides),
+        highs, lows, times, tp, sl, horizon_s
+    )
 
-        # Forward path
-        end_time = entry_time + pd.Timedelta(seconds=horizon_s)
-        fwd = s.loc[(s.index > minute_end) & (s.index <= end_time)]
-        if fwd.empty:
-            continue
-
-        # Thresholds
-        if e["side"] == "long":
-            tp_px = entry_px + tp
-            sl_px = entry_px - sl
-
-            tp_hits = fwd.index[fwd["high"] >= tp_px]
-            sl_hits = fwd.index[fwd["low"]  <= sl_px]
-        else:  # short
-            tp_px = entry_px - tp
-            sl_px = entry_px + sl
-
-            tp_hits = fwd.index[fwd["low"]  <= tp_px]
-            sl_hits = fwd.index[fwd["high"] >= sl_px]
-
-        # Which hit first?
-        first_tp = tp_hits[0] if len(tp_hits) else None
-        first_sl = sl_hits[0] if len(sl_hits) else None
-
-        if first_tp is not None and (first_sl is None or first_tp <= first_sl):
-            label = 1
-            hit = "tp"
-            t_hit_s = int((first_tp - entry_time).total_seconds())
-        elif first_sl is not None:
-            label = 0
-            hit = "sl"
-            t_hit_s = int((first_sl - entry_time).total_seconds())
-        else:
-            label = 0
-            hit = "none"
-            t_hit_s = np.nan
-
-        # MFE/MAE in absolute points (not %)
-        if e["side"] == "long":
-            mfe = float(fwd["high"].max() - entry_px)
-            mae = float(fwd["low"].min()  - entry_px)
-        else:
-            mfe = float(entry_px - fwd["low"].min())
-            mae = float(entry_px - fwd["high"].max())
-
-        rows.append({
-            "datetime_event": e["datetime"],
-            "side": e["side"],
-            "price_event": float(e["close"]),
-            "entry_time": entry_time,
-            "entry_price": entry_px,
-            "tp": tp, "sl": sl, "horizon_s": horizon_s,
-            "label": int(label),
-            "hit": hit,
-            "t_hit_s": t_hit_s,
-            "mfe": mfe,
-            "mae": mae
-        })
-
-    return pd.DataFrame(rows)
+    hit_map = {0:"none",1:"tp",2:"sl"}
+    out = pd.DataFrame({
+        "datetime_event": ev["datetime"].values[:len(entry_idx)],
+        "side": ev["side"].values[:len(entry_idx)],
+        "price_event": ev["close"].values[:len(entry_idx)],
+        "entry_time": pd.to_datetime(entry_times),
+        "entry_price": entry_px,
+        "tp": tp, "sl": sl, "horizon_s": horizon_s,
+        "label": labels,
+        "hit": [hit_map[h] for h in hits],
+        "t_hit_s": t_hits,
+        "mfe": mfes,
+        "mae": maes,
+    })
+    out["features_key_dt"] = out["entry_time"]
+    return out
 
 # ---------------- Main ----------------
 def main():
-    # -------- Colab-friendly defaults --------
     features  = "/content/drive/MyDrive/data/features.csv"
     lr_window = 7
-    cross_on  = "wick"   # or "close"
-    tp        = 30.0
-    sl        = 15.0
-    horizon_s = 600
+    cross_on  = "wick"
+    tp, sl, horizon_s = 30.0, 15.0, 600
 
     print(f"Loading {features} …")
     if not os.path.exists(features):
-        raise FileNotFoundError(f"Features file not found at: {features}")
+        raise FileNotFoundError(features)
 
     df = pd.read_csv(features, parse_dates=["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
 
-    # Ensure required columns exist
-    needed = {"datetime", "open", "high", "low", "close"}
-    missing = needed - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns in features CSV: {sorted(missing)}")
+    needed = {"datetime","open","high","low","close"}
+    if not needed.issubset(df.columns):
+        raise ValueError("Missing required OHLC columns")
 
-    # 1) 1-minute OHLC
     m = resample_1m(df)
-
-    # 2) Rolling LR on 1m close (no lookahead)
     lr = rolling_lr_midline_close(m, window=lr_window)
-    # Use previous-minute LR only
-    lr["lr_mid_prev"]   = lr["lr_mid"].shift(1)
+    lr["lr_mid_prev"] = lr["lr_mid"].shift(1)
     lr["lr_slope_prev"] = lr["lr_slope"].shift(1)
-    lr = lr.dropna(subset=["lr_mid_prev", "lr_slope_prev"])
+    lr = lr.dropna()
+    merged = m.join(lr[["lr_mid_prev","lr_slope_prev"]], how="inner")
+    merged = merged.rename(columns={"lr_mid_prev":"lr_mid","lr_slope_prev":"lr_slope"})
 
-    # 3) Merge OHLC with previous-minute LR (ensures perfect alignment)
-    merged = m.join(lr[["lr_mid_prev", "lr_slope_prev"]], how="inner")
-    merged = merged.rename(columns={"lr_mid_prev": "lr_mid", "lr_slope_prev": "lr_slope"})
-    # from here on, merged has: open, high, low, close, lr_mid, lr_slope
-
-    # 4) Detect crosses (minute-level)
     crosses = detect_crosses(merged, cross_on=cross_on)
 
-    # Build events with sides
-    ev_long = crosses.loc[crosses["long_sig"], ["datetime", "close", "lr_mid", "lr_slope"]].copy()
+    ev_long = crosses.loc[crosses["long_sig"], ["datetime","close","lr_mid","lr_slope"]].copy()
     ev_long["side"] = "long"
-    ev_short = crosses.loc[crosses["short_sig"], ["datetime", "close", "lr_mid", "lr_slope"]].copy()
+    ev_short = crosses.loc[crosses["short_sig"], ["datetime","close","lr_mid","lr_slope"]].copy()
     ev_short["side"] = "short"
-
-    events = pd.concat([ev_long, ev_short], ignore_index=True)
-    events = events.sort_values("datetime").reset_index(drop=True)
+    events = pd.concat([ev_long, ev_short], ignore_index=True).sort_values("datetime")
 
     print(f"Found {len(events)} raw LR-cross events.")
-
     if events.empty:
-        print("No events found. Nothing to label.")
         return
 
-    # 5) Label using forward 1s path (enter next second after event minute)
-    lab = make_labels_1s(
-        df[["datetime", "open", "high", "low", "close"]],
-        events.rename(columns={"datetime": "datetime"}),  # explicit
-        tp, sl, horizon_s
-    )
-
+    lab = make_labels_1s_fast(df[["datetime","open","high","low","close"]], events, tp, sl, horizon_s)
     if lab.empty:
-        print("No labelable events (insufficient forward data).")
+        print("No labelable events.")
         return
 
-    # 6) Write out
-    out = lab.copy()
-    out["features_key_dt"] = out["entry_time"]  # convenient join key at entry time
-    out = out.sort_values("entry_time").reset_index(drop=True)
-    out.to_csv("candidates_lr.csv", index=False)
-
-    print(f"✅ Wrote candidates_lr.csv with {len(out)} rows.")
-    print(out.head(5).to_string(index=False))
+    lab = lab.sort_values("entry_time").reset_index(drop=True)
+    lab.to_csv("candidates_lr.csv", index=False)
+    print(f"✅ Wrote candidates_lr.csv with {len(lab)} rows.")
+    print(lab.head(5).to_string(index=False))
 
 if __name__ == "__main__":
     main()
