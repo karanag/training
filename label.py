@@ -157,16 +157,19 @@ def main():
     m = resample_1m(df)
 
     # 2) LR midline
+       # 2) LR midline
     lr = rolling_lr_midline_close(m, window=lr_window)
     lr["lr_mid_prev"] = lr["lr_mid"].shift(1)
     lr["lr_slope_prev"] = lr["lr_slope"].shift(1)
     lr = lr.dropna(subset=["lr_mid_prev","lr_slope_prev"])
 
-    # 3) Detect crosses (now with OHLC merged)
-    crosses = detect_crosses(
-        lr.rename(columns={"lr_mid_prev":"lr_mid","lr_slope_prev":"lr_slope"}),
-        cross_on=cross_on
-    )
+    # 3) Merge OHLC with shifted LR (ensures alignment)
+    merged = m.join(lr[["lr_mid_prev","lr_slope_prev"]], how="inner")
+    merged = merged.rename(columns={"lr_mid_prev":"lr_mid","lr_slope_prev":"lr_slope"})
+
+    # 4) Detect crosses
+    crosses = detect_crosses(merged, cross_on=cross_on)
+
 
     # 4) Make events
     ev_long = crosses[crosses["long_sig"]].copy()
