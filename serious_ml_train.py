@@ -3,6 +3,8 @@
 """
 Train ML Entry Filter (RF / XGBoost / CatBoost) with EV threshold search
 - Robust to missing columns in candidates: sec_dt, entry_time, features_key_dt
+- Ensures BOTH train and test matrices are fully numeric (fixes XGB 'object' error)
+- Excludes text/label-ish columns like 'hit', 't_hit' from features
 """
 
 import argparse
@@ -33,25 +35,37 @@ def chronological_split(df: pd.DataFrame, frac_train=0.7):
     ntr = int(n * frac_train)
     return df.iloc[:ntr].copy(), df.iloc[ntr:].copy()
 
+def _coerce_numeric_inplace(df: pd.DataFrame):
+    """Coerce all columns to numeric (bool->int8, non-numeric -> numeric with NaN->0)."""
+    for c in df.columns:
+        if df[c].dtype == "bool":
+            df[c] = df[c].astype(np.int8)
+        elif not np.issubdtype(df[c].dtype, np.number):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df.fillna(0.0, inplace=True)
+
 def build_feature_matrix(feats: pd.DataFrame):
     """
-    Keep everything numeric except obvious leakage/ids/prices.
+    Keep everything numeric except obvious leakage/ids/prices and label-ish/text columns.
+    NOTE: We *also* coerce numerics here for TRAIN; TEST will be coerced the same later.
     """
     drop_like = {
+        # prices / identifiers / labels
         "open","high","low","close",
         "day_open","day_high","day_low","day_close",
         "prev_day_open","prev_day_high","prev_day_low","prev_day_close",
         "entry_price","price_event","mfe","mae","tp","sl","horizon_s",
         "label","side","side_enc",
         "datetime","datetime_event","sec_dt","entry_time","features_key_dt",
+        # common label-ish / text cols from candidate builders
+        "hit","t_hit","outcome","reason","signal","signal_name","comment","note",
+        # sometimes sneak in
+        "Unnamed: 0",
     }
     cols = [c for c in feats.columns if (c not in drop_like) and (not c.startswith("Unnamed"))]
-    X = feats[cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    for c in cols:
-        if X[c].dtype == "bool":
-            X[c] = X[c].astype(np.int8)
-        elif not np.issubdtype(X[c].dtype, np.number):
-            X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0.0)
+    X = feats[cols].copy()
+    # Coerce TRAIN to numeric
+    _coerce_numeric_inplace(X)
     return X, cols
 
 def expected_value_from_probs(p: np.ndarray, tp: float, sl: float, fee: float) -> np.ndarray:
@@ -97,16 +111,9 @@ def _coerce_datetimes(df: pd.DataFrame, cols):
     return df
 
 def _ensure_entry_keys(C: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make sure we have entry_time and features_key_dt.
-    If missing, derive best-effort defaults:
-      - entry_time: prefer existing; else datetime_event + 1s; else try 'datetime' + 1s
-      - features_key_dt: entry_time
-    """
+    """Ensure we have entry_time and features_key_dt; derive if missing."""
     have = set(C.columns)
-    # Coerce any present date-like columns
     C = _coerce_datetimes(C, ["datetime_event", "sec_dt", "entry_time", "features_key_dt", "datetime"])
-
     if "entry_time" not in have:
         if "datetime_event" in have:
             C["entry_time"] = C["datetime_event"] + pd.Timedelta(seconds=1)
@@ -115,13 +122,10 @@ def _ensure_entry_keys(C: pd.DataFrame) -> pd.DataFrame:
             C["entry_time"] = C["datetime"] + pd.Timedelta(seconds=1)
             print("⚠️  candidates: 'entry_time' & 'datetime_event' missing → using 'datetime'+1s as fallback.")
         else:
-            raise ValueError("No 'entry_time' or time column to derive it from (need at least 'datetime_event' or 'datetime').")
-
+            raise ValueError("No 'entry_time' or time column to derive it from.")
     if "features_key_dt" not in have:
         C["features_key_dt"] = C["entry_time"]
         print("ℹ️  candidates: 'features_key_dt' missing → set to 'entry_time'.")
-
-    # sec_dt is NOT required for training; ignore if missing
     return C
 
 def _parse_thr_grid(spec: str):
@@ -129,9 +133,7 @@ def _parse_thr_grid(spec: str):
         s, e, step = [float(x) for x in spec.split(":")]
         grid = np.arange(s, e + 1e-9, step)
         grid = grid[(grid >= 0.0) & (grid <= 1.0)]
-        if len(grid) == 0:
-            raise ValueError
-        return grid
+        return grid if len(grid) else np.linspace(0.05, 0.95, 19)
     except Exception:
         return np.linspace(0.05, 0.95, 19)
 
@@ -173,19 +175,15 @@ def main():
 
     # -------- Load candidates (robust) --------
     print(f"Loading candidates: {args.candidates}")
-    # Read without parse_dates; coerce later for whatever exists
     C = pd.read_csv(args.candidates)
     if C.empty:
         raise SystemExit("No candidates found. Generate with entry_candidates_lr.py first.")
-
-    # Ensure we have usable keys
     C = _ensure_entry_keys(C)
     C = C.sort_values("entry_time").reset_index(drop=True)
 
     # -------- Load features --------
     print(f"Loading features: {args.features}")
-    F = pd.read_csv(args.features, parse_dates=["datetime"])
-    F = F.sort_values("datetime").reset_index(drop=True)
+    F = pd.read_csv(args.features, parse_dates=["datetime"]).sort_values("datetime").reset_index(drop=True)
     F_join = F.set_index("datetime")
 
     # Join features at entry_time (exact 1s bar, fallback to asof)
@@ -205,19 +203,22 @@ def main():
     if "side" in D.columns:
         D["side_enc"] = np.where(D["side"].astype(str)=="long", 1, -1).astype(np.int8)
     else:
-        D["side_enc"] = 1  # fallback if side missing
+        D["side_enc"] = 1
 
-    # Labels
+    # Labels check
     if "label" not in D.columns:
         raise SystemExit("Candidates file has no 'label' column. Re-run entry_candidates_lr.py to label events.")
 
     # Chronological split
     Dtr, Dte = chronological_split(D, 0.70)
 
-    # Feature matrix
+    # Feature matrix (TRAIN)
     Xtr, cols = build_feature_matrix(Dtr)
     ytr = Dtr["label"].astype(int).values
-    Xte = Dte[cols].replace([np.inf,-np.inf], 0.0).fillna(0.0)
+
+    # Build TEST with same columns & coerce to numeric
+    Xte = Dte[cols].copy()
+    _coerce_numeric_inplace(Xte)   # <-- critical fix for XGB 'object' error
     yte = Dte["label"].astype(int).values
 
     print(f"Train size: {Xtr.shape[0]}  |  Test size: {Xte.shape[0]}  |  Features: {len(cols)}")
@@ -257,6 +258,8 @@ def main():
             tree_method="hist",
             eval_metric="auc",
             scale_pos_weight=spw,
+            # keep categorical disabled since we coerce to numeric
+            enable_categorical=False,
         )
     elif model_name == "cat":
         if not _HAS_CAT:
