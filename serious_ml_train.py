@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Train ML Entry Filter (RF / XGBoost / CatBoost) with EV threshold search
-- Robust to missing columns in candidates: sec_dt, entry_time, features_key_dt
-- Ensures BOTH train and test matrices are fully numeric (fixes XGB 'object' error)
-- Excludes text/label-ish columns like 'hit', 't_hit' from features
+- Leak-proof: whitelist candidate columns; drop leak-like columns by keyword
+- Ensures BOTH train and test matrices are fully numeric
 """
 
 import argparse
@@ -42,31 +41,50 @@ def _coerce_numeric_inplace(df: pd.DataFrame):
             df[c] = df[c].astype(np.int8)
         elif not np.issubdtype(df[c].dtype, np.number):
             df[c] = pd.to_numeric(df[c], errors="coerce")
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.fillna(0.0, inplace=True)
 
 def build_feature_matrix(feats: pd.DataFrame):
     """
     Keep everything numeric except obvious leakage/ids/prices and label-ish/text columns.
-    NOTE: We *also* coerce numerics here for TRAIN; TEST will be coerced the same later.
+    Also drop any column whose name matches leak-like substrings (case-insensitive).
     """
-    drop_like = {
+    hard_drop = {
         # prices / identifiers / labels
         "open","high","low","close",
         "day_open","day_high","day_low","day_close",
         "prev_day_open","prev_day_high","prev_day_low","prev_day_close",
-        "entry_price","price_event","mfe","mae","tp","sl","horizon_s",
+        "entry_price","price_event","tp","sl","horizon_s",
         "label","side","side_enc",
         "datetime","datetime_event","sec_dt","entry_time","features_key_dt",
-        # common label-ish / text cols from candidate builders
-        "hit","t_hit","outcome","reason","signal","signal_name","comment","note",
         # sometimes sneak in
         "Unnamed: 0",
     }
-    cols = [c for c in feats.columns if (c not in drop_like) and (not c.startswith("Unnamed"))]
-    X = feats[cols].copy()
-    # Coerce TRAIN to numeric
-    _coerce_numeric_inplace(X)
-    return X, cols
+    leakage_keywords = [
+        # outcome/future info
+        "hit", "t_hit", "time_to", "bars_to", "future", "fwd", "ahead",
+        "outcome", "target", "pnl", "realized",
+        # path-dependent post-entry stats
+        "mfe", "mae", "rtn_fwd", "ret_fwd", "fut_", "_fut", "forward",
+    ]
+
+    keep = []
+    dropped_leak = []
+    for c in feats.columns:
+        cl = c.lower()
+        if c in hard_drop or c.startswith("Unnamed"):
+            continue
+        if any(k in cl for k in leakage_keywords):
+            dropped_leak.append(c)
+            continue
+        keep.append(c)
+
+    if dropped_leak:
+        print(f"Leak guard: dropping {len(dropped_leak)} columns: {sorted(dropped_leak)[:8]}{'...' if len(dropped_leak)>8 else ''}")
+
+    X = feats[keep].copy()
+    _coerce_numeric_inplace(X)  # TRAIN numeric
+    return X, keep
 
 def expected_value_from_probs(p: np.ndarray, tp: float, sl: float, fee: float) -> np.ndarray:
     return p*tp - (1.0 - p)*sl - fee
@@ -175,28 +193,34 @@ def main():
 
     # -------- Load candidates (robust) --------
     print(f"Loading candidates: {args.candidates}")
-    C = pd.read_csv(args.candidates)
-    if C.empty:
+    C_raw = pd.read_csv(args.candidates)
+    if C_raw.empty:
         raise SystemExit("No candidates found. Generate with entry_candidates_lr.py first.")
-    C = _ensure_entry_keys(C)
-    C = C.sort_values("entry_time").reset_index(drop=True)
+    C_raw = _ensure_entry_keys(C_raw)
+    C_raw = C_raw.sort_values("entry_time").reset_index(drop=True)
+
+    # Whitelist *only* safe metadata from candidates to avoid leakage
+    keep_from_C = [c for c in ["label", "side", "entry_time", "features_key_dt", "datetime_event", "sec_dt"] if c in C_raw.columns]
+    C = C_raw[keep_from_C].copy()
 
     # -------- Load features --------
     print(f"Loading features: {args.features}")
     F = pd.read_csv(args.features, parse_dates=["datetime"]).sort_values("datetime").reset_index(drop=True)
-    F_join = F.set_index("datetime")
 
-    # Join features at entry_time (exact 1s bar, fallback to asof)
+    # Keep feature set and drop duplicate key before concat
+    F_join = F.set_index("datetime")
     try:
         feats_at_entry = F_join.loc[C["features_key_dt"].values].reset_index().rename(columns={"datetime":"features_key_dt"})
     except KeyError:
-        print("Exact match failed for some rows; falling back to merge_asof backward join.")
+        print("Exact match failed for some rows; using merge_asof backward join.")
         tmpF = F.sort_values("datetime")
         tmpC = C[["features_key_dt"]].rename(columns={"features_key_dt":"datetime"}).sort_values("datetime")
-        joined = pd.merge_asof(tmpC, tmpF, on="datetime", direction="backward")
-        feats_at_entry = joined.rename(columns={"datetime":"features_key_dt"})
+        feats_at_entry = pd.merge_asof(tmpC, tmpF, on="datetime", direction="backward").rename(columns={"datetime":"features_key_dt"})
 
-    # Combine
+    # Avoid duplicate key column
+    feats_at_entry = feats_at_entry.drop(columns=["features_key_dt"], errors="ignore")
+
+    # Combine (safe)
     D = pd.concat([C.reset_index(drop=True), feats_at_entry.reset_index(drop=True)], axis=1)
 
     # Encode side
@@ -218,8 +242,14 @@ def main():
 
     # Build TEST with same columns & coerce to numeric
     Xte = Dte[cols].copy()
-    _coerce_numeric_inplace(Xte)   # <-- critical fix for XGB 'object' error
+    _coerce_numeric_inplace(Xte)
     yte = Dte["label"].astype(int).values
+
+    # Sanity: ensure no leak-like columns survived
+    leak_terms = ["hit","t_hit","time_to","bars_to","future","fwd","ahead","outcome","target","pnl","realized","mfe","mae","rtn_fwd","ret_fwd","fut_","_fut","forward"]
+    leaked = [c for c in cols if any(k in c.lower() for k in leak_terms)]
+    if leaked:
+        raise RuntimeError(f"Leak guard failed; found suspicious columns in features: {leaked}")
 
     print(f"Train size: {Xtr.shape[0]}  |  Test size: {Xte.shape[0]}  |  Features: {len(cols)}")
 
@@ -258,7 +288,6 @@ def main():
             tree_method="hist",
             eval_metric="auc",
             scale_pos_weight=spw,
-            # keep categorical disabled since we coerce to numeric
             enable_categorical=False,
         )
     elif model_name == "cat":
@@ -267,8 +296,8 @@ def main():
         clf = CatBoostClassifier(
             iterations=args.n_estimators,
             depth=args.max_depth if args.max_depth else 8,
-            learning_rate=0.05,
-            l2_leaf_reg=3.0,
+            learning_rate=args.cat_lr,
+            l2_leaf_reg=args.cat_l2,
             loss_function="Logloss",
             eval_metric="AUC",
             random_seed=args.seed,
