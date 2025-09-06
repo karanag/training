@@ -1,0 +1,32 @@
+{
+  "tp": 100.0,
+  "sl": 10.0,
+  "cost": 0.0,
+  "min_trades_valid_per_side": 30,
+  "chunk_rows": 400000,
+  "random_state": 42,
+  "results": {
+    "long": {
+      "name": "long",
+      "clf_path": "model_long.joblib",
+      "calib_path": "calib_long.joblib",
+      "thr": 0.2790697674418605,
+      "valid_trades": 437,
+      "valid_ev": 20.961098398169334,
+      "test_trades": 250,
+      "test_precision": 0.276,
+      "test_ev_per_trade": 20.36
+    },
+    "short": {
+      "name": "short",
+      "clf_path": "model_short.joblib",
+      "calib_path": "calib_short.joblib",
+      "thr": 0.2962962962962963,
+      "valid_trades": 78,
+      "valid_ev": 32.307692307692314,
+      "test_trades": 70,
+      "test_precision": 0.35714285714285715,
+      "test_ev_per_trade": 29.28571428571429
+    }
+  }
+}

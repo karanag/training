@@ -1,346 +1,173 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Entry candidate generator via Linear Regression (LR) midline cross on 1-minute bars.
-Leak-safe (no lookahead). Fast & RAM-safe for Colab.
+Relabel existing candidates_lr.csv with NEW TP/SL (leak-safe, chunked).
+- Reads 1s OHLC from features.csv
+- Uses each row's (entry_time, entry_price, side)
+- Checks next horizon_s seconds for first TP/SL hit
+- Writes candidates_lr_relabelled.csv
 
-- Reads only datetime/open/high/low/close (float32).
-- Auto-prefers a local copy (/content/features.csv) to avoid Drive disconnects.
-- Rolling LR midline via vectorized convolution (no slow per-minute polyfit loop).
-- Previous-minute LR is used for signals (shift by 1m).
-- Entry = first second AFTER the signal minute.
-- Labels via chunked, Numba-accelerated search for first TP/SL hit inside horizon.
-
-Defaults (change with env vars if you like):
-  FEATURES_PATH    = /content/features.csv (falls back to /content/drive/MyDrive/data/features.csv)
-  LR_WINDOW        = 7          (minutes)
-  CROSS_ON         = "wick"     ("close" also supported)
-  TP_POINTS        = 30.0
-  SL_POINTS        = 15.0
-  HORIZON_SECONDS  = 600
-  LABEL_CHUNK_SIZE = 20000
-
-Output: candidates_lr.csv
-Columns:
-  datetime_event, side, price_event, entry_time, entry_price,
-  label, hit, t_hit_s, mfe, mae, features_key_dt
+Usage:
+    python relabel_candidates.py \
+      --features /content/drive/MyDrive/data/features.csv \
+      --candidates candidates_lr.csv \
+      --tp 100 --sl 10 --horizon_s 1800
 """
 
-import os
+import argparse
 import numpy as np
 import pandas as pd
 
-# ---------- Config (env overrides) ----------
-FEATURES_PATH   = os.getenv("FEATURES_PATH", "/content/features.csv")
-FALLBACK_PATH   = "/content/drive/MyDrive/data/features.csv"
-LR_WINDOW       = int(os.getenv("LR_WINDOW", "7"))
-CROSS_ON        = os.getenv("CROSS_ON", "wick")  # "wick" or "close"
-TP_POINTS       = float(os.getenv("TP_POINTS", "30.0"))
-SL_POINTS       = float(os.getenv("SL_POINTS", "15.0"))
-HORIZON_SECONDS = int(os.getenv("HORIZON_SECONDS", "600"))
-CHUNK_SIZE      = int(os.getenv("LABEL_CHUNK_SIZE", "20000"))
+def downcast(df: pd.DataFrame) -> pd.DataFrame:
+    for c in df.select_dtypes(include=["float64"]).columns:
+        df[c] = df[c].astype(np.float32)
+    for c in df.select_dtypes(include=["int64"]).columns:
+        df[c] = df[c].astype(np.int32)
+    return df
 
-# ---------- Fast rolling LR midline (vectorized) ----------
-def rolling_lr_midline_close_vec(close: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Compute rolling OLS y = a + b*x on equidistant x=0..W-1 for CLOSE.
-    Returns (midline_at_last_x, slope) aligned to the original minute index (NaN for first W-1).
-    """
-    y = close.astype(np.float64, copy=False)
-    n = y.shape[0]
-    W = window
-    if n < W:
-        return np.full(n, np.nan), np.full(n, np.nan)
+def relabel_block(ohlc: pd.DataFrame, block: pd.DataFrame, tp: float, sl: float, horizon_s: int) -> pd.DataFrame:
+    # ohlc indexed by datetime; columns: open, high, low, close
+    idx = ohlc.index
+    # Map entry_time -> position
+    pos = idx.get_indexer(block["entry_time"], method="backfill")
+    # If -1, entry time is beyond the last tick → drop
+    ok = pos >= 0
+    block = block.loc[ok].copy()
+    pos = pos[ok]
 
-    # Precompute constants
-    sum_x  = W * (W - 1) / 2.0
-    sum_x2 = (W - 1) * W * (2 * W - 1) / 6.0
-    denom  = W * sum_x2 - sum_x * sum_x
+    highs = ohlc["high"].to_numpy()
+    lows  = ohlc["low"].to_numpy()
+    opens = ohlc["open"].to_numpy()
 
-    # Rolling sums via convolution
-    ones = np.ones(W, dtype=np.float64)
-    weights = np.arange(W, dtype=np.float64)  # 0..W-1
+    # Ensure entry_price comes from series (robustness)
+    entry_px = opens[pos].astype(np.float64)
+    side_arr = block["side"].to_numpy()
 
-    sum_y  = np.convolve(y, ones, mode="valid")            # length n-W+1
-    sum_xy = np.convolve(y, weights, mode="valid")
+    # Compute forward window end indices
+    end_pos = np.minimum(pos + horizon_s, len(idx)-1)
 
-    # Slope and intercept for the valid positions
-    b_valid = (W * sum_xy - sum_x * sum_y) / denom
-    a_valid = (sum_y - b_valid * sum_x) / W
+    labels = np.zeros(len(block), dtype=np.int8)
+    hit = np.array(["none"]*len(block), dtype=object)
+    t_hit = np.full(len(block), np.nan, dtype=np.float32)
+    mfe = np.zeros(len(block), dtype=np.float32)
+    mae = np.zeros(len(block), dtype=np.float32)
 
-    # Midline at x = W-1 (the last bar in the window)
-    mid_valid = a_valid + b_valid * (W - 1)
-
-    # Pad to length n
-    mid = np.full(n, np.nan, dtype=np.float64)
-    slp = np.full(n, np.nan, dtype=np.float64)
-    mid[W-1:] = mid_valid
-    slp[W-1:] = b_valid
-    return mid, slp
-
-# ---------- 1m resample ----------
-def resample_1m(df_1s: pd.DataFrame) -> pd.DataFrame:
-    m = df_1s.resample("1min", on="datetime").agg(
-        open = ("open","first"),
-        high = ("high","max"),
-        low  = ("low","min"),
-        close= ("close","last"),
-    ).dropna()
-    m.index.name = "datetime"
-    return m
-
-# ---------- Detect crosses (previous-minute LR already provided) ----------
-def detect_crosses(df_lr: pd.DataFrame, cross_on: str = "close") -> pd.DataFrame:
-    lr = df_lr["lr_mid"]
-    if cross_on == "wick":
-        prev_below = (df_lr["low"].shift(1)  <= lr)
-        curr_above = (df_lr["high"]          >  lr)
-        prev_above = (df_lr["high"].shift(1) >= lr)
-        curr_below = (df_lr["low"]           <  lr)
-    else:
-        prev_below = (df_lr["close"].shift(1) <= lr)
-        curr_above = (df_lr["close"]          >  lr)
-        prev_above = (df_lr["close"].shift(1) >= lr)
-        curr_below = (df_lr["close"]          <  lr)
-
-    long_sig  = (prev_below & curr_above).fillna(False)
-    short_sig = (prev_above & curr_below).fillna(False)
-
-    out = pd.DataFrame({
-        "datetime": df_lr.index,
-        "close": df_lr["close"].to_numpy(),
-        "lr_mid": df_lr["lr_mid"].to_numpy(),
-        "lr_slope": df_lr["lr_slope"].to_numpy(),
-        "long_sig": long_sig.to_numpy(),
-        "short_sig": short_sig.to_numpy(),
-    })
-    out.index = pd.RangeIndex(len(out))
-    return out
-
-# ---------- Numba-accelerated labeling ----------
-try:
-    from numba import njit
-    NUMBA_OK = True
-except Exception:
-    NUMBA_OK = False
-    def njit(*args, **kwargs):
-        def wrap(f): return f
-        return wrap
-
-@njit(cache=True)
-def _label_batch_numba(
-    ts_ns: np.ndarray,     # int64 ns, ascending, 1s sampling
-    o: np.ndarray, h: np.ndarray, l: np.ndarray,
-    sec_idx: np.ndarray,   # index of last second of signal minute
-    side: np.ndarray,      # +1 long, -1 short
-    price_event: np.ndarray,
-    tp: float, sl: float, horizon: int
-):
-    n_events = sec_idx.shape[0]
-    N = ts_ns.shape[0]
-    label = np.zeros(n_events, np.int8)
-    hit = np.zeros(n_events, np.int8)  # 1=tp, 2=sl, 0=none
-    t_hit = np.empty(n_events, np.float64)
-    t_hit.fill(np.nan)
-    entry_idx = np.full(n_events, -1, np.int64)
-    entry_price = np.empty(n_events, np.float64)
-
-    mfe = np.zeros(n_events, np.float64)
-    mae = np.zeros(n_events, np.float64)
-
-    for i in range(n_events):
-        si = sec_idx[i]
-        if si < 0 or si >= N-1:
-            continue
-        eidx = si + 1
-        entry_idx[i] = eidx
-        ep = o[eidx]
-        entry_price[i] = ep
-
-        end_idx = eidx + horizon
-        if end_idx >= N:
-            end_idx = N - 1
-        if end_idx <= eidx:
+    for i in range(len(block)):
+        a = pos[i]
+        b = end_pos[i]
+        if b <= a:
             continue
 
-        first_tp = -1
-        first_sl = -1
+        if side_arr[i] == "long":
+            tp_px = entry_px[i] + tp
+            sl_px = entry_px[i] - sl
 
-        if side[i] == 1:  # long
-            tp_px = ep + tp
-            sl_px = ep - sl
-            # scan forward
-            for t in range(eidx, end_idx + 1):
-                if h[t] >= tp_px:
-                    first_tp = t
-                    break
-                if l[t] <= sl_px:
-                    first_sl = t
-                    break
-            # MFE/MAE
-            maxh = h[eidx:end_idx+1].max()
-            minl = l[eidx:end_idx+1].min()
-            mfe[i] = maxh - ep
-            mae[i] = minl - ep
+            # First TP/SL time
+            tp_idx = np.flatnonzero(highs[a+1:b+1] >= tp_px)
+            sl_idx = np.flatnonzero(lows[a+1:b+1]  <= sl_px)
+
+            first_tp = (a+1+tp_idx[0]) if tp_idx.size else None
+            first_sl = (a+1+sl_idx[0]) if sl_idx.size else None
+
+            if first_tp is not None and (first_sl is None or first_tp <= first_sl):
+                labels[i] = 1; hit[i] = "tp"; t_hit[i] = float(first_tp - a)
+            elif first_sl is not None:
+                labels[i] = 0; hit[i] = "sl"; t_hit[i] = float(first_sl - a)
+            else:
+                labels[i] = 0; hit[i] = "none"; t_hit[i] = np.nan
+
+            mfe[i] = float(highs[a+1:b+1].max() - entry_px[i])
+            mae[i] = float(lows[a+1:b+1].min()  - entry_px[i])
+
         else:  # short
-            tp_px = ep - tp
-            sl_px = ep + sl
-            for t in range(eidx, end_idx + 1):
-                if l[t] <= tp_px:
-                    first_tp = t
-                    break
-                if h[t] >= sl_px:
-                    first_sl = t
-                    break
-            maxh = h[eidx:end_idx+1].max()
-            minl = l[eidx:end_idx+1].min()
-            mfe[i] = ep - minl
-            mae[i] = ep - maxh
+            tp_px = entry_px[i] - tp
+            sl_px = entry_px[i] + sl
 
-        if first_tp != -1 and (first_sl == -1 or first_tp <= first_sl):
-            label[i] = 1
-            hit[i] = 1
-            t_hit[i] = float(first_tp - eidx)
-        elif first_sl != -1:
-            label[i] = 0
-            hit[i] = 2
-            t_hit[i] = float(first_sl - eidx)
-        else:
-            label[i] = 0
-            hit[i] = 0
-            t_hit[i] = np.nan
+            tp_idx = np.flatnonzero(lows[a+1:b+1]  <= tp_px)
+            sl_idx = np.flatnonzero(highs[a+1:b+1] >= sl_px)
 
-    return entry_idx, entry_price, label, hit, t_hit, mfe, mae
+            first_tp = (a+1+tp_idx[0]) if tp_idx.size else None
+            first_sl = (a+1+sl_idx[0]) if sl_idx.size else None
 
-# ---------- Utilities to map minute -> last second index ----------
-def minute_last_second_index(ts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    ts: datetime64[ns] ascending
-    Returns (minute_keys_int64, last_idx_per_minute)
-    """
-    minute = ts.astype('datetime64[m]').astype('int64')
-    # Positions where minute changes; the element BEFORE change is last of prev minute.
-    change = minute[1:] != minute[:-1]
-    last_idx = np.flatnonzero(change)
-    # plus the very last row is last of its minute
-    last_idx = np.append(last_idx, len(ts) - 1)
-    minute_keys = minute[last_idx]
-    return minute_keys, last_idx
+            if first_tp is not None and (first_sl is None or first_tp <= first_sl):
+                labels[i] = 1; hit[i] = "tp"; t_hit[i] = float(first_tp - a)
+            elif first_sl is not None:
+                labels[i] = 0; hit[i] = "sl"; t_hit[i] = float(first_sl - a)
+            else:
+                labels[i] = 0; hit[i] = "none"; t_hit[i] = np.nan
 
-# ---------- Main ----------
+            mfe[i] = float(entry_px[i] - lows[a+1:b+1].min())
+            mae[i] = float(entry_px[i] - highs[a+1:b+1].max())
+
+    block["tp"] = tp; block["sl"] = sl; block["horizon_s"] = horizon_s
+    block["label"] = labels
+    block["hit"] = hit
+    block["t_hit_s"] = t_hit
+    block["mfe"] = mfe
+    block["mae"] = mae
+    return block
+
 def main():
-    path = FEATURES_PATH if os.path.exists(FEATURES_PATH) else FALLBACK_PATH
-    print(f"Loading {path} …")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Features file not found at: {path}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--features", required=True)
+    ap.add_argument("--candidates", default="candidates_lr.csv")
+    ap.add_argument("--tp", type=float, required=True)
+    ap.add_argument("--sl", type=float, required=True)
+    ap.add_argument("--horizon_s", type=int, default=1800)
+    ap.add_argument("--chunk_days", type=int, default=3, help="process N trading days at a time to cap RAM")
+    args = ap.parse_args()
 
-    # Read only what we need, downcast to save RAM
-    usecols = ["datetime", "open", "high", "low", "close"]
-    df = pd.read_csv(
-        path,
-        usecols=usecols,
-        parse_dates=["datetime"],
-        dtype={"open":"float32","high":"float32","low":"float32","close":"float32"},
-        engine="c",
-        memory_map=True,
-    ).sort_values("datetime").reset_index(drop=True)
+    print(f"Loading candidates: {args.candidates}")
+    cand = pd.read_csv(args.candidates, parse_dates=["entry_time","datetime_event"])
+    if {"entry_time","side"}.difference(cand.columns):
+        raise ValueError("candidates file must have 'entry_time' and 'side' columns")
+    cand["entry_time"] = pd.to_datetime(cand["entry_time"])
+    cand = cand.sort_values("entry_time").reset_index(drop=True)
 
-    # 1) 1-minute OHLC
-    m = resample_1m(df)
+    print(f"Loading features (OHLC only): {args.features}")
+    use_cols = ["datetime","open","high","low","close"]
+    fe = pd.read_csv(args.features, usecols=use_cols, parse_dates=["datetime"])
+    fe = fe.sort_values("datetime").reset_index(drop=True)
+    fe = downcast(fe)
+    fe = fe.dropna(subset=["open","high","low","close"])
+    fe = fe.set_index("datetime")
 
-    # 2) Rolling LR on 1m close (vectorized, no lookahead), then SHIFT by 1 minute
-    mid, slp = rolling_lr_midline_close_vec(m["close"].to_numpy(), LR_WINDOW)
-    m_lr = m.copy()
-    m_lr["lr_mid"]   = pd.Series(mid, index=m.index).shift(1)
-    m_lr["lr_slope"] = pd.Series(slp, index=m.index).shift(1)
-    m_lr = m_lr.dropna(subset=["lr_mid","lr_slope"])
+    # Process in day-chunks (assumes continuous session per day)
+    days = pd.DatetimeIndex(cand["entry_time"]).normalize()
+    uniq_days = pd.to_datetime(sorted(days.unique()))
+    out_parts = []
 
-    # 3) Cross detection on minutes (using previous-minute LR)
-    crosses = detect_crosses(m_lr, cross_on=CROSS_ON)
+    for i in range(0, len(uniq_days), args.chunk_days):
+        chunk_days = uniq_days[i:i+args.chunk_days]
+        # candidates in these days
+        msk = days.isin(chunk_days)
+        block = cand.loc[msk].copy()
+        if block.empty:
+            continue
 
-    # Build events
-    ev_long = crosses.loc[crosses["long_sig"], ["datetime","close","lr_mid","lr_slope"]].copy()
-    ev_long["side"] = "long"
-    ev_short = crosses.loc[crosses["short_sig"], ["datetime","close","lr_mid","lr_slope"]].copy()
-    ev_short["side"] = "short"
-    events = pd.concat([ev_long, ev_short], ignore_index=True).sort_values("datetime").reset_index(drop=True)
-    print(f"Found {len(events)} raw LR-cross events.")
-    if events.empty:
-        print("No events found. Exiting.")
-        return
+        # corresponding OHLC slice with a small pad on both sides
+        start = chunk_days.min()
+        end   = chunk_days.max() + pd.Timedelta(days=1)
+        ohlc = fe.loc[(fe.index >= start) & (fe.index < end)]
+        if ohlc.empty:
+            continue
 
-    # 4) Prepare 1s arrays for fast labeling
-    s = df.copy()
-    ts = s["datetime"].values  # datetime64[ns]
-    ts_ns = ts.view("int64")   # for numba; still monotonic
-    o = s["open"].to_numpy(np.float64, copy=False)
-    h = s["high"].to_numpy(np.float64, copy=False)
-    l = s["low"].to_numpy(np.float64, copy=False)
+        print(f"Relabeling {len(block)} entries for {len(chunk_days)} day(s) [{start.date()} .. {end.date()}]")
+        block = relabel_block(ohlc, block, args.tp, args.sl, args.horizon_s)
+        out_parts.append(block)
 
-    # Map each minute to the index of its LAST second
-    minute_keys, last_idx = minute_last_second_index(ts)
-    minute_to_last = pd.Series(last_idx, index=minute_keys)
+    if not out_parts:
+        raise RuntimeError("No candidates relabeled (check date ranges).")
 
-    # Events minute keys -> last second index
-    ev_minute_keys = events["datetime"].values.astype("datetime64[m]").astype("int64")
-    # Use pandas align to keep vectorized mapping; non-existing minutes -> NaN
-    ev_sec_idx = minute_to_last.reindex(ev_minute_keys).to_numpy()
-    # Drop events we cannot map (e.g., partial last minute)
-    ok = ~np.isnan(ev_sec_idx)
-    events = events.loc[ok].reset_index(drop=True)
-    ev_sec_idx = ev_sec_idx[ok].astype(np.int64)
+    out = pd.concat(out_parts, axis=0, ignore_index=True)
+    # Keep same columns as original + updated label fields
+    # And preserve features_key_dt if you had it
+    if "features_key_dt" not in out.columns and "entry_time" in out.columns:
+        out["features_key_dt"] = out["entry_time"]
 
-    # Encode side as +1/-1
-    side = np.where(events["side"].values == "long", 1, -1).astype(np.int8)
-    price_event = events["close"].to_numpy(np.float64, copy=False)
-
-    # 5) Chunked + Numba labeling
-    out_path = "candidates_lr.csv"
-    if os.path.exists(out_path):
-        os.remove(out_path)
-
-    out_cols = [
-        "datetime_event","side","price_event","entry_time","entry_price",
-        "label","hit","t_hit_s","mfe","mae","features_key_dt"
-    ]
-
-    total = len(events)
-    for start in range(0, total, CHUNK_SIZE):
-        end = min(start + CHUNK_SIZE, total)
-        ev_idx = np.arange(start, end)
-        sec_idx_batch = ev_sec_idx[ev_idx]
-        side_batch = side[ev_idx]
-        price_batch = price_event[ev_idx]
-
-        entry_idx, entry_price, label, hit, t_hit, mfe, mae = _label_batch_numba(
-            ts_ns, o, h, l,
-            sec_idx_batch, side_batch, price_batch,
-            TP_POINTS, SL_POINTS, HORIZON_SECONDS
-        )
-
-        # Build DataFrame for this batch
-        batch = pd.DataFrame({
-            "datetime_event": events.loc[ev_idx, "datetime"].values,
-            "side": np.where(side_batch == 1, "long", "short"),
-            "price_event": price_batch.astype(np.float32),
-            "entry_time": ts[entry_idx.clip(min=0)],
-            "entry_price": entry_price.astype(np.float32),
-            "label": label.astype(np.int8),
-            "hit": pd.Series(hit).map({0:"none",1:"tp",2:"sl"}).values,
-            "t_hit_s": t_hit.astype(np.float32),
-            "mfe": mfe.astype(np.float32),
-            "mae": mae.astype(np.float32),
-        })
-        batch["features_key_dt"] = batch["entry_time"]
-
-        # Append to disk
-        batch.to_csv(out_path, index=False, mode=("a" if start else "w"), header=(start == 0), columns=out_cols)
-        print(f"Processed {end}/{total} events")
-
-    print(f"✅ Wrote {out_path}")
-    # Show a peek
-    peek = pd.read_csv(out_path, nrows=5, parse_dates=["datetime_event","entry_time","features_key_dt"])
-    print(peek.to_string(index=False))
+    out = out.sort_values("entry_time").reset_index(drop=True)
+    out.to_csv("candidates_lr_relabelled.csv", index=False)
+    print(f"✅ Wrote candidates_lr_relabelled.csv with {len(out)} rows.")
 
 if __name__ == "__main__":
     main()
