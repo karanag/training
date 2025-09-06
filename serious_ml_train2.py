@@ -16,8 +16,8 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from joblib import dump
 
 CAND_PATH  = "candidates_lr.csv"
-FEATS_PATH = "/content/drive/MyDrive/data/features.csv"
-TP, SL, COST = 30.0, 15.0, 0.0
+FEATS_PATH = "features_with_regimes_intra.csv"
+TP, SL, COST = 50.0, 10.0, 0.0
 CHUNK_ROWS, PRINT_EVERY = 400_000, 5
 RANDOM_STATE = 42
 SOFT_MIN_VALID_TRADES = 50   # allow fewer if EV is strongly positive
@@ -205,25 +205,30 @@ def main():
     res_short = train_side("short", (df["side"].values=="short"))
 
     # Write test preds
+    # Write test preds
     rows = []
     if res_long is not None:
+        test_mask = idx_te & (df["side"].values == "long")
         rows.append(pd.DataFrame({
-            "entry_time": df.loc[df["side"].values=="long", "entry_time"].values,
+            "entry_time": df.loc[test_mask, "entry_time"].values,
             "side": "long",
             "prob": res_long["pb_te"],
             "label": res_long["y_te"],
             "pred": (res_long["pb_te"] >= res_long["thr"]).astype(int),
             "gate": res_long["gate"].astype(int)
         }))
+
     if res_short is not None:
+        test_mask = idx_te & (df["side"].values == "short")
         rows.append(pd.DataFrame({
-            "entry_time": df.loc[df["side"].values=="short", "entry_time"].values,
+            "entry_time": df.loc[test_mask, "entry_time"].values,
             "side": "short",
             "prob": res_short["pb_te"],
             "label": res_short["y_te"],
             "pred": (res_short["pb_te"] >= res_short["thr"]).astype(int),
             "gate": res_short["gate"].astype(int)
         }))
+
     if rows:
         out = pd.concat(rows, axis=0, ignore_index=True).sort_values("entry_time")
         out.to_csv("ml_preds_test.csv", index=False)

@@ -8,7 +8,7 @@ Relabel existing candidates_lr.csv with NEW TP/SL (leak-safe, chunked).
 - Writes candidates_lr_relabelled.csv
 
 Usage:
-    python relabel_candidates.py \
+    python label.py \
       --features /content/drive/MyDrive/data/features.csv \
       --candidates candidates_lr.csv \
       --tp 100 --sl 10 --horizon_s 1800
