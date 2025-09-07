@@ -5,7 +5,10 @@ Train ML Entry Filter (RF / XGBoost / CatBoost) with EV threshold search
 - Leak-proof: hard/keyword drops for outcome/future/path-dependent fields
 - Chronological splits (train/test, and train_fit / train_cal)
 - Optional isotonic/sigmoid calibration on *later* train slice (time-aware)
-- XGBoost early-stopping on train_cal (still within train period)
+- XGBoost early-stopping:
+    * try sklearn wrapper
+    * else fall back to xgboost.train with DMatrix
+    * else no early stopping
 - Fully numeric matrices (no object dtypes), NaN/Inf safe
 - Saves: model+calibrator, scored test, feature importance, EV curves, thresholds
 """
@@ -27,9 +30,11 @@ from sklearn.calibration import CalibratedClassifierCV
 # Optional imports (guarded)
 try:
     from xgboost import XGBClassifier
+    import xgboost as xgb  # for DMatrix / train fallback
     _HAS_XGB = True
 except Exception:
     _HAS_XGB = False
+    xgb = None
 
 try:
     from catboost import CatBoostClassifier
@@ -172,6 +177,26 @@ def _parse_thr_grid(spec: str):
         return np.linspace(0.05, 0.95, 19)
 
 
+# ----- Adapter to use xgboost.core.Booster like a sklearn estimator -----
+
+class XGBBoosterAdapter:
+    def __init__(self, booster, feature_names):
+        self.booster = booster
+        self.feature_names = list(feature_names)
+        # Try to expose a sklearn-like attr for convenience
+        try:
+            score = booster.get_score(importance_type="gain")
+            self.feature_importances_ = np.array([float(score.get(name, 0.0)) for name in self.feature_names])
+        except Exception:
+            self.feature_importances_ = None
+
+    def predict_proba(self, X):
+        D = xgb.DMatrix(X.values, feature_names=self.feature_names)
+        p = self.booster.predict(D)
+        # ensure 2-column proba
+        return np.column_stack([1.0 - p, p])
+
+
 # ----------------------- Main -----------------------
 
 def main():
@@ -282,6 +307,8 @@ def main():
 
     # -------- Build model --------
     model_name = args.model.lower()
+    model_obj = None  # this will be either a sklearn model or an XGBBoosterAdapter
+
     if model_name == "rf":
         clf = RandomForestClassifier(
             n_estimators=args.n_estimators,
@@ -290,6 +317,7 @@ def main():
             random_state=args.seed,
             class_weight=(None if args.class_weight in ["None","none",""] else args.class_weight)
         )
+        model_obj = clf
 
     elif model_name == "xgb":
         if not _HAS_XGB:
@@ -304,6 +332,8 @@ def main():
             spw = float(args.xgb_scale_pos_weight)
 
         max_depth = 0 if args.xgb_max_leaves and args.xgb_max_leaves > 0 else args.xgb_depth
+
+        # Try sklearn wrapper first
         clf = XGBClassifier(
             n_estimators=args.n_estimators,
             learning_rate=args.xgb_lr,
@@ -321,6 +351,7 @@ def main():
             scale_pos_weight=spw,
             enable_categorical=False,
         )
+        model_obj = clf
 
     elif model_name == "cat":
         if not _HAS_CAT:
@@ -336,51 +367,81 @@ def main():
             verbose=False,
             allow_writing_files=False
         )
+        model_obj = clf
     else:
         raise ValueError("Unknown model.")
 
-    # -------- Train (with early stopping for XGB) --------
+    # -------- Train (with robust early stopping for XGB) --------
     print(f"Training {model_name.upper()} …")
-    if model_name == "xgb" and args.early_stopping_rounds > 0 and len(Xcal) > 0:
-        # Try the kwarg (works on many versions); if not, fall back to callbacks API
-        try:
-            clf.fit(
-                Xfit, yfit,
-                eval_set=[(Xcal, ycal)],
-                early_stopping_rounds=args.early_stopping_rounds,
-                verbose=False
-            )
-        except TypeError:
-            # Older/newer wrappers: use callback-based early stopping
+
+    if model_name != "xgb":
+        model_obj.fit(Xfit, yfit)
+
+    else:
+        used_fallback_train = False
+        # 1) Try sklearn wrapper with early_stopping_rounds
+        tried = False
+        if args.early_stopping_rounds > 0 and len(Xcal) > 0:
+            tried = True
             try:
-                from xgboost.callback import EarlyStopping
-                callbacks = [
-                    EarlyStopping(
-                        rounds=args.early_stopping_rounds,
-                        save_best=True,
-                        maximize=True  # AUC is a "higher is better" metric
-                    )
-                ]
-                clf.fit(
+                model_obj.fit(
                     Xfit, yfit,
                     eval_set=[(Xcal, ycal)],
-                    callbacks=callbacks,
+                    early_stopping_rounds=args.early_stopping_rounds,
                     verbose=False
                 )
-            except Exception as e:
-                print(f"Early stopping via callbacks failed ({e}); training without early stopping.")
-                clf.fit(Xfit, yfit)
-    else:
-        clf.fit(Xfit, yfit)
+            except TypeError:
+                # 2) Try xgboost.train with DMatrix
+                try:
+                    if xgb is None:
+                        raise RuntimeError("xgboost core module unavailable.")
+                    dtrain = xgb.DMatrix(Xfit.values, label=yfit, feature_names=cols)
+                    dvalid = xgb.DMatrix(Xcal.values, label=ycal, feature_names=cols)
+                    params = {
+                        "objective": "binary:logistic",
+                        "eval_metric": "auc",
+                        "eta": args.xgb_lr,
+                        # depth/leaves: pick whichever user chose
+                        **({"max_depth": args.xgb_depth} if (args.xgb_max_leaves==0 or args.xgb_max_leaves is None) else {}),
+                        **({"max_leaves": args.xgb_max_leaves} if (args.xgb_max_leaves and args.xgb_max_leaves>0) else {}),
+                        "subsample": args.xgb_subsample,
+                        "colsample_bytree": args.xgb_colsample,
+                        "lambda": 1.0,
+                        "alpha": 0.0,
+                        "random_state": args.seed,
+                        "tree_method": "hist",
+                        "scale_pos_weight": spw,
+                    }
+                    booster = xgb.train(
+                        params,
+                        dtrain,
+                        num_boost_round=args.n_estimators,
+                        evals=[(dvalid, "valid")],
+                        early_stopping_rounds=args.early_stopping_rounds,
+                        verbose_eval=False
+                    )
+                    model_obj = XGBBoosterAdapter(booster, cols)
+                    used_fallback_train = True
+                except Exception as e:
+                    print(f"Early stopping via xgboost.train failed ({e}); training without early stopping.")
+                    model_obj = clf  # back to sklearn wrapper
+                    model_obj.fit(Xfit, yfit)
 
+        if not tried:
+            # No early stopping requested or no cal slice
+            model_obj.fit(Xfit, yfit)
 
     # -------- Optional probability calibration (time-aware) --------
     calibrator = None
     if args.calibrate != "none" and len(Xcal) > 0:
         method = args.calibrate  # "isotonic" or "sigmoid"
         print(f"Calibrating probabilities using {method} on train-cal slice …")
-        # Use prefit mode: base model already trained
-        cal = CalibratedClassifierCV(base_estimator=clf, method=method, cv="prefit")
+        # sklearn 1.1+: CalibratedClassifierCV(estimator=..., cv="prefit")
+        # older: base_estimator=...
+        try:
+            cal = CalibratedClassifierCV(estimator=model_obj, method=method, cv="prefit")
+        except TypeError:
+            cal = CalibratedClassifierCV(base_estimator=model_obj, method=method, cv="prefit")
         cal.fit(Xcal, ycal)
         calibrator = cal
 
@@ -388,9 +449,9 @@ def main():
     def _proba(est, X):
         return (calibrator if calibrator is not None else est).predict_proba(X)[:, 1]
 
-    proba_fit = _proba(clf, Xfit)
-    proba_cal = _proba(clf, Xcal) if len(Xcal) else np.zeros(len(Xcal))
-    proba_te  = _proba(clf, Xte)
+    proba_fit = _proba(model_obj, Xfit)
+    proba_cal = _proba(model_obj, Xcal) if len(Xcal) else np.zeros(len(Xcal))
+    proba_te  = _proba(model_obj, Xte)
 
     def _scores(y, p, tag):
         auc = roc_auc_score(y, p)
@@ -411,7 +472,7 @@ def main():
     # -------- Save model (+ calibration if present) --------
     bundle = {
         "model_type": model_name,
-        "model": clf,
+        "model": model_obj,          # sklearn model OR XGBBoosterAdapter
         "calibration": (args.calibrate if calibrator is not None else "none"),
         "calibrator": calibrator,
         "features": cols,
@@ -421,16 +482,13 @@ def main():
         "params": vars(args),
     }
     dump(bundle, outdir / "ml_entry_model.joblib")
-    print("Saved ml_entry_model.joblib (includes model, optional calibrator, and feature list).")
+    print("Saved ml_entry_model.joblib (includes model/adapter, optional calibrator, and feature list).")
 
     # -------- Feature importance --------
     fi = None
     try:
-        if hasattr(clf, "feature_importances_") and clf.feature_importances_ is not None:
-            imp = np.asarray(clf.feature_importances_, dtype=float)
-            fi = pd.DataFrame({"feature": cols, "importance": imp})
-        elif _HAS_CAT and isinstance(clf, CatBoostClassifier):
-            imp = clf.get_feature_importance(type="PredictionValuesChange")
+        if hasattr(model_obj, "feature_importances_") and model_obj.feature_importances_ is not None:
+            imp = np.asarray(model_obj.feature_importances_, dtype=float)
             fi = pd.DataFrame({"feature": cols, "importance": imp})
     except Exception as e:
         print(f"Feature importance extraction failed: {e}")
@@ -440,7 +498,7 @@ def main():
         fi.to_csv(outdir / "ml_entry_feature_importance.csv", index=False)
         print("Wrote ml_entry_feature_importance.csv")
     else:
-        print("No native feature_importances_; skipping export.")
+        print("No native feature_importances_; skipping export (use permutation importance if needed).")
 
     # -------- Score TEST & save --------
     Dte_out = Dte.copy()
@@ -473,7 +531,7 @@ def main():
     print("Wrote ml_entry_thresholds.csv (EV-optimal).")
 
     # -------- Print EV summary + break-even reference --------
-    be = (args.sl + args.fee) / (args.tp + args.sl)  # ~0.175 for TP=50, SL=10, fee=0.5
+    be = (args.sl + args.fee) / (args.tp + args.sl)
     print(f"\nBreak-even success probability ≈ {be:.3f} (given TP={args.tp}, SL={args.sl}, fee={args.fee}).")
     print("\nEV-optimal thresholds (summary):")
     print(thr_df.to_string(index=False))
