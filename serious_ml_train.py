@@ -4,8 +4,8 @@
 Train ML Entry Filter (RF / XGBoost / CatBoost) with EV threshold search
 - Leak-proof: hard/keyword drops for outcome/future/path-dependent fields
 - Chronological splits (train/test, and train_fit / train_cal)
-- Optional isotonic/sigmoid calibration on *later* train slice (time-aware)
-- XGBoost early-stopping:
+- Manual calibration (isotonic / sigmoid) on *later* train slice (time-aware)
+- Robust XGBoost early-stopping:
     * try sklearn wrapper
     * else fall back to xgboost.train with DMatrix
     * else no early stopping
@@ -14,18 +14,18 @@ Train ML Entry Filter (RF / XGBoost / CatBoost) with EV threshold search
 """
 
 import argparse
-import json
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from joblib import dump
-from pathlib import Path
 
 from sklearn.metrics import (
-    classification_report, roc_auc_score, average_precision_score,
-    brier_score_loss
+    classification_report, roc_auc_score, average_precision_score, brier_score_loss
 )
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
+from sklearn.base import BaseEstimator, ClassifierMixin
 
 # Optional imports (guarded)
 try:
@@ -87,8 +87,7 @@ def build_feature_matrix(feats: pd.DataFrame):
         "mfe","mae","rtn_fwd","ret_fwd","fut_","_fut","forward",
     ]
 
-    keep = []
-    dropped = []
+    keep, dropped = [], []
     for c in feats.columns:
         cl = c.lower()
         if c in hard_drop or c.startswith("Unnamed"):
@@ -177,24 +176,70 @@ def _parse_thr_grid(spec: str):
         return np.linspace(0.05, 0.95, 19)
 
 
-# ----- Adapter to use xgboost.core.Booster like a sklearn estimator -----
+# ----- XGB Booster adapter (sklearn-like) -----
 
-class XGBBoosterAdapter:
+class XGBBoosterAdapter(BaseEstimator, ClassifierMixin):
+    """Wrap an xgboost.core.Booster to look like a sklearn classifier."""
     def __init__(self, booster, feature_names):
         self.booster = booster
         self.feature_names = list(feature_names)
-        # Try to expose a sklearn-like attr for convenience
+        self.feature_importances_ = None
         try:
             score = booster.get_score(importance_type="gain")
             self.feature_importances_ = np.array([float(score.get(name, 0.0)) for name in self.feature_names])
         except Exception:
-            self.feature_importances_ = None
+            pass
+        self.classes_ = np.array([0, 1], dtype=int)
+        self.n_features_in_ = len(self.feature_names)
+
+    def fit(self, X, y=None):
+        # no-op, but keep sklearn happy
+        try:
+            if y is not None:
+                self.classes_ = np.unique(y)
+        except Exception:
+            pass
+        try:
+            self.n_features_in_ = X.shape[1]
+        except Exception:
+            pass
+        return self
 
     def predict_proba(self, X):
         D = xgb.DMatrix(X.values, feature_names=self.feature_names)
         p = self.booster.predict(D)
-        # ensure 2-column proba
         return np.column_stack([1.0 - p, p])
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
+# ----- Manual probability calibrators -----
+
+class IsotonicCalib:
+    def __init__(self):
+        self.iso = IsotonicRegression(out_of_bounds="clip")
+
+    def fit(self, p_raw: np.ndarray, y: np.ndarray):
+        self.iso.fit(p_raw, y)
+        return self
+
+    def transform(self, p_raw: np.ndarray) -> np.ndarray:
+        return np.asarray(self.iso.predict(p_raw))
+
+class SigmoidCalib:
+    """Platt scaling on raw probabilities with a 1D logistic regression."""
+    def __init__(self, C=1.0):
+        self.lr = LogisticRegression(C=C, solver="lbfgs", max_iter=1000)
+
+    def fit(self, p_raw: np.ndarray, y: np.ndarray):
+        x = p_raw.reshape(-1, 1)
+        self.lr.fit(x, y)
+        return self
+
+    def transform(self, p_raw: np.ndarray) -> np.ndarray:
+        x = p_raw.reshape(-1, 1)
+        return self.lr.predict_proba(x)[:, 1]
 
 
 # ----------------------- Main -----------------------
@@ -307,7 +352,7 @@ def main():
 
     # -------- Build model --------
     model_name = args.model.lower()
-    model_obj = None  # this will be either a sklearn model or an XGBBoosterAdapter
+    model_obj = None  # sklearn model OR XGBBoosterAdapter
 
     if model_name == "rf":
         clf = RandomForestClassifier(
@@ -371,18 +416,18 @@ def main():
     else:
         raise ValueError("Unknown model.")
 
-    # -------- Train (with robust early stopping for XGB) --------
+    # -------- Train (robust early stopping for XGB) --------
     print(f"Training {model_name.upper()} …")
 
     if model_name != "xgb":
         model_obj.fit(Xfit, yfit)
 
     else:
-        used_fallback_train = False
         # 1) Try sklearn wrapper with early_stopping_rounds
-        tried = False
-        if args.early_stopping_rounds > 0 and len(Xcal) > 0:
-            tried = True
+        used_fallback_train = False
+        tried_es = False
+        if isinstance(model_obj, XGBClassifier) and args.early_stopping_rounds > 0 and len(Xcal) > 0:
+            tried_es = True
             try:
                 model_obj.fit(
                     Xfit, yfit,
@@ -391,7 +436,7 @@ def main():
                     verbose=False
                 )
             except TypeError:
-                # 2) Try xgboost.train with DMatrix
+                # 2) Fallback: xgboost.train with DMatrix
                 try:
                     if xgb is None:
                         raise RuntimeError("xgboost core module unavailable.")
@@ -401,7 +446,6 @@ def main():
                         "objective": "binary:logistic",
                         "eval_metric": "auc",
                         "eta": args.xgb_lr,
-                        # depth/leaves: pick whichever user chose
                         **({"max_depth": args.xgb_depth} if (args.xgb_max_leaves==0 or args.xgb_max_leaves is None) else {}),
                         **({"max_leaves": args.xgb_max_leaves} if (args.xgb_max_leaves and args.xgb_max_leaves>0) else {}),
                         "subsample": args.xgb_subsample,
@@ -420,34 +464,33 @@ def main():
                         early_stopping_rounds=args.early_stopping_rounds,
                         verbose_eval=False
                     )
-                    model_obj = XGBBoosterAdapter(booster, cols)
+                    model_obj = XGBBoosterAdapter(booster, cols).fit(Xfit, yfit)  # populate sklearn attrs
                     used_fallback_train = True
                 except Exception as e:
                     print(f"Early stopping via xgboost.train failed ({e}); training without early stopping.")
                     model_obj = clf  # back to sklearn wrapper
                     model_obj.fit(Xfit, yfit)
 
-        if not tried:
+        if not tried_es:
             # No early stopping requested or no cal slice
             model_obj.fit(Xfit, yfit)
 
-    # -------- Optional probability calibration (time-aware) --------
+    # -------- Optional probability calibration (time-aware, manual) --------
     calibrator = None
     if args.calibrate != "none" and len(Xcal) > 0:
-        method = args.calibrate  # "isotonic" or "sigmoid"
-        print(f"Calibrating probabilities using {method} on train-cal slice …")
-        # sklearn 1.1+: CalibratedClassifierCV(estimator=..., cv="prefit")
-        # older: base_estimator=...
-        try:
-            cal = CalibratedClassifierCV(estimator=model_obj, method=method, cv="prefit")
-        except TypeError:
-            cal = CalibratedClassifierCV(base_estimator=model_obj, method=method, cv="prefit")
-        cal.fit(Xcal, ycal)
-        calibrator = cal
+        print(f"Calibrating probabilities using {args.calibrate} on train-cal slice …")
+        p_cal_raw = np.asarray(model_obj.predict_proba(Xcal)[:, 1])
+        if args.calibrate == "isotonic":
+            calibrator = IsotonicCalib().fit(p_cal_raw, ycal)
+        elif args.calibrate == "sigmoid":
+            calibrator = SigmoidCalib(C=1.0).fit(p_cal_raw, ycal)
 
     # -------- Evaluate --------
     def _proba(est, X):
-        return (calibrator if calibrator is not None else est).predict_proba(X)[:, 1]
+        p = est.predict_proba(X)[:, 1]
+        if calibrator is not None:
+            p = calibrator.transform(p)
+        return p
 
     proba_fit = _proba(model_obj, Xfit)
     proba_cal = _proba(model_obj, Xcal) if len(Xcal) else np.zeros(len(Xcal))
@@ -463,7 +506,7 @@ def main():
     print("Performance (probabilities may be calibrated):")
     m_fit = _scores(yfit, proba_fit, "FIT ")
     if len(Xcal):
-        m_cal = _scores(ycal, proba_cal, "CAL ")
+        _ = _scores(ycal, proba_cal, "CAL ")
     m_te  = _scores(yte,  proba_te,  "TEST")
 
     print("\nTEST classification report @ default 0.5 threshold:")
@@ -472,9 +515,9 @@ def main():
     # -------- Save model (+ calibration if present) --------
     bundle = {
         "model_type": model_name,
-        "model": model_obj,          # sklearn model OR XGBBoosterAdapter
-        "calibration": (args.calibrate if calibrator is not None else "none"),
-        "calibrator": calibrator,
+        "model": model_obj,           # sklearn model OR XGBBoosterAdapter
+        "calibration": args.calibrate if calibrator is not None else "none",
+        "calibrator": calibrator,     # IsotonicCalib or SigmoidCalib, or None
         "features": cols,
         "train_frac": args.train_frac,
         "cal_frac": args.cal_frac,
@@ -517,7 +560,10 @@ def main():
     # Per-group thresholds (e.g., per HMM 'regime')
     gcol = args.group_threshold_by
     if gcol and gcol in Dte_out.columns:
-        best_by, table_by = search_threshold_by_group(Dte_out.assign(proba_pred=proba_te), group_col=gcol, tp=args.tp, sl=args.sl, fee=args.fee, grid=grid)
+        best_by, table_by = search_threshold_by_group(
+            Dte_out.assign(proba_pred=proba_te), group_col=gcol,
+            tp=args.tp, sl=args.sl, fee=args.fee, grid=grid
+        )
         table_by.to_csv(outdir / f"ml_entry_thresholds_by_{gcol}_curve.csv", index=False)
         print(f"Wrote ml_entry_thresholds_by_{gcol}_curve.csv")
         for g, dct in best_by.items():
@@ -535,6 +581,7 @@ def main():
     print(f"\nBreak-even success probability ≈ {be:.3f} (given TP={args.tp}, SL={args.sl}, fee={args.fee}).")
     print("\nEV-optimal thresholds (summary):")
     print(thr_df.to_string(index=False))
+
 
 if __name__ == "__main__":
     main()
