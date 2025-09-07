@@ -2,16 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 Train ML Entry Filter (RF / XGBoost / CatBoost) with EV threshold search
-- Leak-proof: whitelist candidate columns; drop leak-like columns by keyword
-- Ensures BOTH train and test matrices are fully numeric
+- Leak-proof: hard/keyword drops for outcome/future/path-dependent fields
+- Chronological splits (train/test, and train_fit / train_cal)
+- Optional isotonic/sigmoid calibration on *later* train slice (time-aware)
+- XGBoost early-stopping on train_cal (still within train period)
+- Fully numeric matrices (no object dtypes), NaN/Inf safe
+- Saves: model+calibrator, scored test, feature importance, EV curves, thresholds
 """
 
 import argparse
+import json
 import numpy as np
 import pandas as pd
 from joblib import dump
-from sklearn.metrics import classification_report, roc_auc_score, average_precision_score
+from pathlib import Path
+
+from sklearn.metrics import (
+    classification_report, roc_auc_score, average_precision_score,
+    brier_score_loss
+)
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import CalibratedClassifierCV
 
 # Optional imports (guarded)
 try:
@@ -34,8 +45,14 @@ def chronological_split(df: pd.DataFrame, frac_train=0.7):
     ntr = int(n * frac_train)
     return df.iloc[:ntr].copy(), df.iloc[ntr:].copy()
 
+def chronological_2split(df: pd.DataFrame, frac_fit=0.85):
+    """Split a TRAIN dataframe into fit and calibration subsets chronologically."""
+    n = len(df)
+    nfit = int(n * frac_fit)
+    return df.iloc[:nfit].copy(), df.iloc[nfit:].copy()
+
 def _coerce_numeric_inplace(df: pd.DataFrame):
-    """Coerce all columns to numeric (bool->int8, non-numeric -> numeric with NaN->0)."""
+    """Coerce all columns to numeric (bool->int8, non-numeric -> numeric), sanitize NaN/Inf."""
     for c in df.columns:
         if df[c].dtype == "bool":
             df[c] = df[c].astype(np.int8)
@@ -46,8 +63,7 @@ def _coerce_numeric_inplace(df: pd.DataFrame):
 
 def build_feature_matrix(feats: pd.DataFrame):
     """
-    Keep everything numeric except obvious leakage/ids/prices and label-ish/text columns.
-    Also drop any column whose name matches leak-like substrings (case-insensitive).
+    Keep everything numeric except prices/ids and leak-like columns.
     """
     hard_drop = {
         # prices / identifiers / labels
@@ -57,36 +73,36 @@ def build_feature_matrix(feats: pd.DataFrame):
         "entry_price","price_event","tp","sl","horizon_s",
         "label","side","side_enc",
         "datetime","datetime_event","sec_dt","entry_time","features_key_dt",
-        # sometimes sneak in
         "Unnamed: 0",
     }
     leakage_keywords = [
-        # outcome/future info
-        "hit", "t_hit", "time_to", "bars_to", "future", "fwd", "ahead",
-        "outcome", "target", "pnl", "realized",
-        # path-dependent post-entry stats
-        "mfe", "mae", "rtn_fwd", "ret_fwd", "fut_", "_fut", "forward",
+        # outcome / future / forward path info
+        "hit","t_hit","time_to","bars_to","future","fwd","ahead",
+        "outcome","target","pnl","realized",
+        "mfe","mae","rtn_fwd","ret_fwd","fut_","_fut","forward",
     ]
 
     keep = []
-    dropped_leak = []
+    dropped = []
     for c in feats.columns:
         cl = c.lower()
         if c in hard_drop or c.startswith("Unnamed"):
             continue
         if any(k in cl for k in leakage_keywords):
-            dropped_leak.append(c)
-            continue
+            dropped.append(c); continue
         keep.append(c)
 
-    if dropped_leak:
-        print(f"Leak guard: dropping {len(dropped_leak)} columns: {sorted(dropped_leak)[:8]}{'...' if len(dropped_leak)>8 else ''}")
+    if dropped:
+        print(f"Leak guard: dropped {len(dropped)} suspicious columns "
+              f"(showing up to 8): {sorted(dropped)[:8]}{'...' if len(dropped)>8 else ''}")
 
     X = feats[keep].copy()
     _coerce_numeric_inplace(X)  # TRAIN numeric
     return X, keep
 
 def expected_value_from_probs(p: np.ndarray, tp: float, sl: float, fee: float) -> np.ndarray:
+    # EV per trade at probability p:
+    # EV = p*TP - (1-p)*SL - fee
     return p*tp - (1.0 - p)*sl - fee
 
 def search_threshold(proba: np.ndarray, y_true: np.ndarray, tp: float, sl: float, fee: float, grid=None):
@@ -162,7 +178,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--features", required=True, help="features_with_regimes*.csv (1s features)")
     ap.add_argument("--candidates", default="candidates_lr.csv", help="LR-cross candidates file")
-    ap.add_argument("--model", choices=["rf", "xgb", "cat"], default="rf")
+    ap.add_argument("--model", choices=["rf", "xgb", "cat"], default="xgb")
+
+    # Splits
+    ap.add_argument("--train_frac", type=float, default=0.70, help="Chronological train fraction")
+    ap.add_argument("--cal_frac", type=float, default=0.15, help="Fraction of TRAIN kept for calibration (rest for fitting)")
+
+    # RF
     ap.add_argument("--n_estimators", type=int, default=600)
     ap.add_argument("--max_depth", type=int, default=12)
     ap.add_argument("--class_weight", default="balanced")  # RF only
@@ -174,11 +196,15 @@ def main():
     ap.add_argument("--xgb_subsample", type=float, default=0.8)
     ap.add_argument("--xgb_colsample", type=float, default=0.8)
     ap.add_argument("--xgb_scale_pos_weight", default="auto")
+    ap.add_argument("--early_stopping_rounds", type=int, default=100)
 
     # CatBoost
     ap.add_argument("--cat_depth", type=int, default=8)
     ap.add_argument("--cat_lr", type=float, default=0.05)
     ap.add_argument("--cat_l2", type=float, default=3.0)
+
+    # Calibration
+    ap.add_argument("--calibrate", choices=["none","isotonic","sigmoid"], default="isotonic")
 
     ap.add_argument("--seed", type=int, default=42)
 
@@ -186,12 +212,13 @@ def main():
     ap.add_argument("--tp", type=float, default=25.0)
     ap.add_argument("--sl", type=float, default=15.0)
     ap.add_argument("--fee", type=float, default=0.0)
-    ap.add_argument("--group_threshold_by", default="")
+    ap.add_argument("--group_threshold_by", default="regime")  # if present in data
     ap.add_argument("--thr_grid", default="0.05:0.95:0.05")
 
     args = ap.parse_args()
+    outdir = Path(".")
 
-    # -------- Load candidates (robust) --------
+    # -------- Load candidates (safe) --------
     print(f"Loading candidates: {args.candidates}")
     C_raw = pd.read_csv(args.candidates)
     if C_raw.empty:
@@ -199,16 +226,16 @@ def main():
     C_raw = _ensure_entry_keys(C_raw)
     C_raw = C_raw.sort_values("entry_time").reset_index(drop=True)
 
-    # Whitelist *only* safe metadata from candidates to avoid leakage
+    # Whitelist minimal metadata to avoid any accidental leakage
     keep_from_C = [c for c in ["label", "side", "entry_time", "features_key_dt", "datetime_event", "sec_dt"] if c in C_raw.columns]
     C = C_raw[keep_from_C].copy()
 
     # -------- Load features --------
     print(f"Loading features: {args.features}")
     F = pd.read_csv(args.features, parse_dates=["datetime"]).sort_values("datetime").reset_index(drop=True)
-
-    # Keep feature set and drop duplicate key before concat
     F_join = F.set_index("datetime")
+
+    # Join features at exact second (fallback asof-backward)
     try:
         feats_at_entry = F_join.loc[C["features_key_dt"].values].reset_index().rename(columns={"datetime":"features_key_dt"})
     except KeyError:
@@ -217,10 +244,8 @@ def main():
         tmpC = C[["features_key_dt"]].rename(columns={"features_key_dt":"datetime"}).sort_values("datetime")
         feats_at_entry = pd.merge_asof(tmpC, tmpF, on="datetime", direction="backward").rename(columns={"datetime":"features_key_dt"})
 
-    # Avoid duplicate key column
+    # Avoid duplicate key column; combine
     feats_at_entry = feats_at_entry.drop(columns=["features_key_dt"], errors="ignore")
-
-    # Combine (safe)
     D = pd.concat([C.reset_index(drop=True), feats_at_entry.reset_index(drop=True)], axis=1)
 
     # Encode side
@@ -233,25 +258,27 @@ def main():
     if "label" not in D.columns:
         raise SystemExit("Candidates file has no 'label' column. Re-run entry_candidates_lr.py to label events.")
 
-    # Chronological split
-    Dtr, Dte = chronological_split(D, 0.70)
+    # -------- Chronological splits --------
+    Dtr, Dte = chronological_split(D, args.train_frac)
+    Dfit, Dcal = chronological_2split(Dtr, 1.0 - args.cal_frac)  # e.g. 85% fit, 15% cal inside TRAIN
 
-    # Feature matrix (TRAIN)
-    Xtr, cols = build_feature_matrix(Dtr)
-    ytr = Dtr["label"].astype(int).values
+    # Feature matrices
+    Xfit, cols = build_feature_matrix(Dfit)
+    yfit = Dfit["label"].astype(int).values
 
-    # Build TEST with same columns & coerce to numeric
-    Xte = Dte[cols].copy()
-    _coerce_numeric_inplace(Xte)
-    yte = Dte["label"].astype(int).values
+    Xcal = Dcal[cols].copy(); _coerce_numeric_inplace(Xcal)
+    ycal = Dcal["label"].astype(int).values
 
-    # Sanity: ensure no leak-like columns survived
+    Xte  = Dte[cols].copy();  _coerce_numeric_inplace(Xte)
+    yte  = Dte["label"].astype(int).values
+
+    # Final leak sanity
     leak_terms = ["hit","t_hit","time_to","bars_to","future","fwd","ahead","outcome","target","pnl","realized","mfe","mae","rtn_fwd","ret_fwd","fut_","_fut","forward"]
     leaked = [c for c in cols if any(k in c.lower() for k in leak_terms)]
     if leaked:
-        raise RuntimeError(f"Leak guard failed; found suspicious columns in features: {leaked}")
+        raise RuntimeError(f"Leak guard failed; suspicious columns in features: {leaked}")
 
-    print(f"Train size: {Xtr.shape[0]}  |  Test size: {Xte.shape[0]}  |  Features: {len(cols)}")
+    print(f"Fit size: {Xfit.shape[0]} | Cal size: {Xcal.shape[0]} | Test size: {Xte.shape[0]} | Features: {len(cols)}")
 
     # -------- Build model --------
     model_name = args.model.lower()
@@ -263,15 +290,19 @@ def main():
             random_state=args.seed,
             class_weight=(None if args.class_weight in ["None","none",""] else args.class_weight)
         )
+
     elif model_name == "xgb":
         if not _HAS_XGB:
             raise SystemExit("XGBoost not installed. pip install xgboost")
+
+        # scale_pos_weight from FIT split
         if args.xgb_scale_pos_weight == "auto":
-            pos = max(ytr.sum(), 1)
-            neg = len(ytr) - pos
+            pos = max(yfit.sum(), 1)
+            neg = len(yfit) - pos
             spw = float(neg / pos)
         else:
             spw = float(args.xgb_scale_pos_weight)
+
         max_depth = 0 if args.xgb_max_leaves and args.xgb_max_leaves > 0 else args.xgb_depth
         clf = XGBClassifier(
             n_estimators=args.n_estimators,
@@ -290,12 +321,13 @@ def main():
             scale_pos_weight=spw,
             enable_categorical=False,
         )
+
     elif model_name == "cat":
         if not _HAS_CAT:
             raise SystemExit("CatBoost not installed. pip install catboost")
         clf = CatBoostClassifier(
             iterations=args.n_estimators,
-            depth=args.max_depth if args.max_depth else 8,
+            depth=args.cat_depth if args.cat_depth else args.max_depth if args.max_depth else 8,
             learning_rate=args.cat_lr,
             l2_leaf_reg=args.cat_l2,
             loss_function="Logloss",
@@ -307,33 +339,73 @@ def main():
     else:
         raise ValueError("Unknown model.")
 
-    # -------- Train --------
+    # -------- Train (with early stopping for XGB) --------
     print(f"Training {model_name.upper()} …")
-    clf.fit(Xtr, ytr)
+    if model_name == "xgb" and args.early_stopping_rounds > 0 and len(Xcal) > 0:
+        clf.fit(
+            Xfit, yfit,
+            eval_set=[(Xcal, ycal)],
+            early_stopping_rounds=args.early_stopping_rounds,
+            verbose=False
+        )
+    else:
+        clf.fit(Xfit, yfit)
+
+    # -------- Optional probability calibration (time-aware) --------
+    calibrator = None
+    if args.calibrate != "none" and len(Xcal) > 0:
+        method = args.calibrate  # "isotonic" or "sigmoid"
+        print(f"Calibrating probabilities using {method} on train-cal slice …")
+        # Use prefit mode: base model already trained
+        cal = CalibratedClassifierCV(base_estimator=clf, method=method, cv="prefit")
+        cal.fit(Xcal, ycal)
+        calibrator = cal
 
     # -------- Evaluate --------
-    proba_tr = clf.predict_proba(Xtr)[:,1]
-    proba_te = clf.predict_proba(Xte)[:,1]
+    def _proba(est, X):
+        return (calibrator if calibrator is not None else est).predict_proba(X)[:, 1]
 
-    auc_tr = roc_auc_score(ytr, proba_tr)
-    auc_te = roc_auc_score(yte, proba_te)
-    ap_te  = average_precision_score(yte, proba_te)
+    proba_fit = _proba(clf, Xfit)
+    proba_cal = _proba(clf, Xcal) if len(Xcal) else np.zeros(len(Xcal))
+    proba_te  = _proba(clf, Xte)
 
-    print(f"AUC  train: {auc_tr:.3f}")
-    print(f"AUC  test : {auc_te:.3f}")
-    print(f"AP   test : {ap_te:.3f}")
+    def _scores(y, p, tag):
+        auc = roc_auc_score(y, p)
+        ap  = average_precision_score(y, p)
+        bs  = brier_score_loss(y, p)
+        print(f"{tag}  AUC: {auc:.3f} | AP: {ap:.3f} | Brier: {bs:.4f}")
+        return {"auc": auc, "ap": ap, "brier": bs}
+
+    print("Performance (probabilities may be calibrated):")
+    m_fit = _scores(yfit, proba_fit, "FIT ")
+    if len(Xcal):
+        m_cal = _scores(ycal, proba_cal, "CAL ")
+    m_te  = _scores(yte,  proba_te,  "TEST")
+
     print("\nTEST classification report @ default 0.5 threshold:")
     print(classification_report(yte, (proba_te>=0.5).astype(int), digits=3))
 
-    # -------- Save model --------
-    dump(clf, "ml_entry_model.joblib")
-    print("Saved ml_entry_model.joblib")
+    # -------- Save model (+ calibration if present) --------
+    bundle = {
+        "model_type": model_name,
+        "model": clf,
+        "calibration": (args.calibrate if calibrator is not None else "none"),
+        "calibrator": calibrator,
+        "features": cols,
+        "train_frac": args.train_frac,
+        "cal_frac": args.cal_frac,
+        "metrics": {"fit": m_fit, "test": m_te},
+        "params": vars(args),
+    }
+    dump(bundle, outdir / "ml_entry_model.joblib")
+    print("Saved ml_entry_model.joblib (includes model, optional calibrator, and feature list).")
 
     # -------- Feature importance --------
     fi = None
     try:
         if hasattr(clf, "feature_importances_") and clf.feature_importances_ is not None:
-            fi = pd.DataFrame({"feature": cols, "importance": clf.feature_importances_.astype(float)})
+            imp = np.asarray(clf.feature_importances_, dtype=float)
+            fi = pd.DataFrame({"feature": cols, "importance": imp})
         elif _HAS_CAT and isinstance(clf, CatBoostClassifier):
             imp = clf.get_feature_importance(type="PredictionValuesChange")
             fi = pd.DataFrame({"feature": cols, "importance": imp})
@@ -342,7 +414,7 @@ def main():
 
     if fi is not None:
         fi = fi.sort_values("importance", ascending=False).reset_index(drop=True)
-        fi.to_csv("ml_entry_feature_importance.csv", index=False)
+        fi.to_csv(outdir / "ml_entry_feature_importance.csv", index=False)
         print("Wrote ml_entry_feature_importance.csv")
     else:
         print("No native feature_importances_; skipping export.")
@@ -350,33 +422,36 @@ def main():
     # -------- Score TEST & save --------
     Dte_out = Dte.copy()
     Dte_out["proba_pred"] = proba_te
-    Dte_out.to_csv("ml_entry_candidates_scored.csv", index=False)
+    Dte_out.to_csv(outdir / "ml_entry_candidates_scored.csv", index=False)
     print("Wrote ml_entry_candidates_scored.csv (TEST split).")
 
     # -------- EV-optimal thresholds --------
     grid = _parse_thr_grid(args.thr_grid)
-
     best_global, table_global = search_threshold(proba_te, yte, tp=args.tp, sl=args.sl, fee=args.fee, grid=grid)
-    table_global.to_csv("ml_entry_thresholds_global_curve.csv", index=False)
+    table_global.to_csv(outdir / "ml_entry_thresholds_global_curve.csv", index=False)
     print("Wrote ml_entry_thresholds_global_curve.csv")
 
-    thresholds_rows = [{"group_by": "GLOBAL", **best_global}]
+    thr_rows = [{"group_by": "GLOBAL", **best_global}]
 
-    if args.group_threshold_by:
-        gcol = args.group_threshold_by
-        if gcol not in Dte_out.columns:
-            print(f"Group column '{gcol}' not found in data; skipping per-group thresholds.")
-        else:
-            best_by, table_by = search_threshold_by_group(Dte_out, group_col=gcol, tp=args.tp, sl=args.sl, fee=args.fee, grid=grid)
-            table_by.to_csv(f"ml_entry_thresholds_by_{gcol}_curve.csv", index=False)
-            print(f"Wrote ml_entry_thresholds_by_{gcol}_curve.csv")
-            for g, dct in best_by.items():
-                thresholds_rows.append({"group_by": f"{gcol}={g}", **dct})
+    # Per-group thresholds (e.g., per HMM 'regime')
+    gcol = args.group_threshold_by
+    if gcol and gcol in Dte_out.columns:
+        best_by, table_by = search_threshold_by_group(Dte_out.assign(proba_pred=proba_te), group_col=gcol, tp=args.tp, sl=args.sl, fee=args.fee, grid=grid)
+        table_by.to_csv(outdir / f"ml_entry_thresholds_by_{gcol}_curve.csv", index=False)
+        print(f"Wrote ml_entry_thresholds_by_{gcol}_curve.csv")
+        for g, dct in best_by.items():
+            thr_rows.append({"group_by": f"{gcol}={g}", **dct})
+    else:
+        if gcol:
+            print(f"Group column '{gcol}' not found in TEST; skipping per-group thresholds.")
 
-    thr_df = pd.DataFrame(thresholds_rows)
-    thr_df.to_csv("ml_entry_thresholds.csv", index=False)
+    thr_df = pd.DataFrame(thr_rows)
+    thr_df.to_csv(outdir / "ml_entry_thresholds.csv", index=False)
     print("Wrote ml_entry_thresholds.csv (EV-optimal).")
 
+    # -------- Print EV summary + break-even reference --------
+    be = (args.sl + args.fee) / (args.tp + args.sl)  # ~0.175 for TP=50, SL=10, fee=0.5
+    print(f"\nBreak-even success probability ≈ {be:.3f} (given TP={args.tp}, SL={args.sl}, fee={args.fee}).")
     print("\nEV-optimal thresholds (summary):")
     print(thr_df.to_string(index=False))
 
