@@ -342,14 +342,37 @@ def main():
     # -------- Train (with early stopping for XGB) --------
     print(f"Training {model_name.upper()} …")
     if model_name == "xgb" and args.early_stopping_rounds > 0 and len(Xcal) > 0:
-        clf.fit(
-            Xfit, yfit,
-            eval_set=[(Xcal, ycal)],
-            early_stopping_rounds=args.early_stopping_rounds,
-            verbose=False
-        )
+        # Try the kwarg (works on many versions); if not, fall back to callbacks API
+        try:
+            clf.fit(
+                Xfit, yfit,
+                eval_set=[(Xcal, ycal)],
+                early_stopping_rounds=args.early_stopping_rounds,
+                verbose=False
+            )
+        except TypeError:
+            # Older/newer wrappers: use callback-based early stopping
+            try:
+                from xgboost.callback import EarlyStopping
+                callbacks = [
+                    EarlyStopping(
+                        rounds=args.early_stopping_rounds,
+                        save_best=True,
+                        maximize=True  # AUC is a "higher is better" metric
+                    )
+                ]
+                clf.fit(
+                    Xfit, yfit,
+                    eval_set=[(Xcal, ycal)],
+                    callbacks=callbacks,
+                    verbose=False
+                )
+            except Exception as e:
+                print(f"Early stopping via callbacks failed ({e}); training without early stopping.")
+                clf.fit(Xfit, yfit)
     else:
         clf.fit(Xfit, yfit)
+
 
     # -------- Optional probability calibration (time-aware) --------
     calibrator = None
